@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { motion, AnimatePresence } from "motion/react"
 import { CheckCircle2, XCircle, Loader2 } from "lucide-react"
 
@@ -39,24 +39,59 @@ export function TransactionVerifier({
 }: TransactionVerifierProps) {
   const [status, setStatus] = useState<TransactionStatus>({ status: "pending" })
   const [loading, setLoading] = useState(true)
+  const onSuccessRef = useRef(onSuccess)
+  const onFailureRef = useRef(onFailure)
 
   useEffect(() => {
-    let pollInterval: NodeJS.Timeout
-    let initialDelay: NodeJS.Timeout
+    onSuccessRef.current = onSuccess
+    onFailureRef.current = onFailure
+  }, [onSuccess, onFailure])
+
+  useEffect(() => {
+    let cancelled = false
+    let finished = false
+    let initialDelay: ReturnType<typeof setTimeout> | undefined
+    let pollDelay: ReturnType<typeof setTimeout> | undefined
+    let pollCount = 0
+    const maxPolls = 36 // Initial check + 35 retries at 5 seconds each
+
+    const endpoint = BLOCKSCOUT_ENDPOINTS[network]
+
+    setStatus({ status: "pending" })
+    setLoading(true)
+
+    const finish = (nextStatus: TransactionStatus) => {
+      if (cancelled || finished) return
+
+      finished = true
+      if (initialDelay) clearTimeout(initialDelay)
+      if (pollDelay) clearTimeout(pollDelay)
+
+      setStatus(nextStatus)
+      setLoading(false)
+
+      if (nextStatus.status === "success") {
+        onSuccessRef.current?.()
+      } else {
+        onFailureRef.current?.()
+      }
+    }
+
+    if (!endpoint) {
+      finish({
+        status: "failed",
+        errorMessage: `Network "${network}" not supported for verification`,
+      })
+
+      return () => {
+        cancelled = true
+      }
+    }
 
     const checkTransaction = async () => {
-      try {
-        const endpoint = BLOCKSCOUT_ENDPOINTS[network]
-        
-        if (!endpoint) {
-          setStatus({
-            status: "failed",
-            errorMessage: `Network "${network}" not supported for verification`
-          })
-          setLoading(false)
-          return
-        }
+      if (cancelled || finished) return
 
+      try {
         // Blockscout API call to get transaction details
         const response = await fetch(
           `${endpoint}?module=transaction&action=gettxinfo&txhash=${txHash}`
@@ -67,7 +102,9 @@ export function TransactionVerifier({
         }
 
         const data = await response.json()
-        
+
+        if (cancelled || finished) return
+
         console.log("📊 Blockscout API Response:", {
           status: data.status,
           hasResult: !!data.result,
@@ -76,21 +113,21 @@ export function TransactionVerifier({
 
         if (data.status === "1" && data.result) {
           const tx = data.result
-          
+
           console.log("🔍 Transaction Details:", {
             success: tx.success,
             blockNumber: tx.blockNumber,
             confirmations: tx.confirmations,
             hash: tx.hash
           })
-          
+
           // Check if transaction is successful
           // Blockscout API returns: success: true/false
           const isSuccess = tx.success === true
-          
+
           if (isSuccess) {
             console.log("✅ Transaction SUCCESS!")
-            setStatus({
+            finish({
               status: "success",
               blockNumber: parseInt(tx.blockNumber),
               confirmations: parseInt(tx.confirmations || "0"),
@@ -99,70 +136,49 @@ export function TransactionVerifier({
               to: tx.to,
               value: tx.value,
             })
-            setLoading(false)
-            onSuccess?.()
-            return // Stop polling
+            return
           } else {
             // Transaction failed (explicit error)
             console.log("❌ Transaction FAILED!")
-            setStatus({
+            finish({
               status: "failed",
               errorMessage: tx.errDescription || tx.revertReason || "Transaction failed",
               blockNumber: parseInt(tx.blockNumber),
             })
-            setLoading(false)
-            onFailure?.()
-            return // Stop polling
+            return
           }
         } else {
           // Transaction not found or still pending
           console.log("⏳ Transaction not found yet, continuing to poll...")
-          setStatus({ status: "pending" })
         }
       } catch (error) {
         console.error("Error checking transaction:", error)
         // Don't stop polling on errors - transaction might not be indexed yet
-        // Just keep status as pending and continue trying
-        setStatus({ status: "pending" })
       }
-    }
 
-    // Wait 2 seconds before first check to let transaction propagate
-    initialDelay = setTimeout(() => {
-      checkTransaction()
-    }, 2000)
+      if (cancelled || finished) return
 
-    // Poll every 5 seconds for up to 3 minutes
-    let pollCount = 0
-    const maxPolls = 36 // 5 seconds * 36 = 3 minutes
-
-    pollInterval = setInterval(() => {
       pollCount++
-      
       if (pollCount >= maxPolls) {
-        clearInterval(pollInterval)
-        setStatus({
+        finish({
           status: "failed",
           errorMessage: "Transaction verification timeout. The transaction may still be processing. Please check Blockscout manually."
         })
-        setLoading(false)
-        onFailure?.()
         return
       }
 
-      // Continue polling while pending or loading
-      if (status.status === "pending" || loading) {
-        checkTransaction()
-      } else {
-        clearInterval(pollInterval)
-      }
-    }, 5000)
+      pollDelay = setTimeout(checkTransaction, 5000)
+    }
+
+    // Wait 2 seconds before first check to let transaction propagate
+    initialDelay = setTimeout(checkTransaction, 2000)
 
     return () => {
+      cancelled = true
       if (initialDelay) clearTimeout(initialDelay)
-      if (pollInterval) clearInterval(pollInterval)
+      if (pollDelay) clearTimeout(pollDelay)
     }
-  }, [txHash, network, onSuccess, onFailure])
+  }, [txHash, network])
 
   return (
     <AnimatePresence>
